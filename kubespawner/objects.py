@@ -432,6 +432,26 @@ def make_pvc(
 
     return pvc
 
+def make_service(
+        name,
+        selectors,
+        ports
+):
+    service = V1Service()
+
+    service.kind = "Service"
+    service.api_version = "v1"
+
+    service.metadata = V1ObjectMeta()
+    service.metadata.name = name
+
+    service.spec = V1ServiceSpec()
+
+    service.spec.selector = selectors
+    service.spec.ports = [V1ServicePort(**port) for port in ports]
+
+    return service
+
 def make_ingress(
         name,
         routespec,

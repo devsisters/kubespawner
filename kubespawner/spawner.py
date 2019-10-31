@@ -37,7 +37,7 @@ from jinja2 import Environment, BaseLoader
 
 from .clients import shared_client
 from kubespawner.traitlets import Callable
-from kubespawner.objects import make_pod, make_pvc
+from kubespawner.objects import make_pod, make_pvc, make_service
 from kubespawner.reflector import NamespacedResourceReflector
 from asyncio import sleep
 from async_generator import async_generator, yield_
@@ -140,6 +140,7 @@ class KubeSpawner(Spawner):
         # runs during both test and normal execution
         self.pod_name = self._expand_user_properties(self.pod_name_template)
         self.pvc_name = self._expand_user_properties(self.pvc_name_template)
+        self.service_name = self._expand_user_properties(self.service_name_template)
         if self.working_dir:
             self.working_dir = self._expand_user_properties(self.working_dir)
         if self.port == 0:
@@ -292,6 +293,20 @@ class KubeSpawner(Spawner):
 
         `{username}` is expanded to the escaped, dns-label safe username.
 
+        This must be unique within the namespace the pvc are being spawned
+        in, so if you are running multiple jupyterhubs spawning in the
+        same namespace, consider setting this to be something more unique.
+        """
+    )
+
+    service_name_template = Unicode(
+        'service-{username}{servername}',
+        config=True,
+        help="""
+        Template to use to form the name of user's service
+        
+        `{username}` is expanded to the escaped, dns-label safe username.
+        
         This must be unique within the namespace the pvc are being spawned
         in, so if you are running multiple jupyterhubs spawning in the
         same namespace, consider setting this to be something more unique.
@@ -1376,6 +1391,33 @@ class KubeSpawner(Spawner):
             annotations=annotations
         )
 
+    # FIXME: This is naive approach.. (borrow selector from extraLabels)
+    def get_service_manifest(self):
+        """
+        Make a service manifest that will spawn current user's service.
+        """
+        selectors = self._expand_all(self.extra_labels)
+        ports = [
+            {
+                'protocol': 'TCP',
+                'port': 5555,
+                'target_port': 5555,
+                'name': 'driver-port'
+            },
+            {
+                'protocol': 'TCP',
+                'port': 5556,
+                'target_port': 5556,
+                'name': 'block-manager-port'
+            }
+        ]
+
+        return make_service(
+            name=self.service_name,
+            selectors=selectors,
+            ports=ports
+        )
+
     def is_pod_running(self, pod):
         """
         Check if the given pod is running
@@ -1417,6 +1459,9 @@ class KubeSpawner(Spawner):
         # deprecate image
         env['JUPYTER_IMAGE_SPEC'] = self.image
         env['JUPYTER_IMAGE'] = self.image
+
+        # FIXME: Inject service host info.. how to inject this information more clearly??
+        env['JUPYTERHUB_SINGLEUSER_SERVICE_NAME'] = self.service_name
 
         return env
 
@@ -1674,6 +1719,21 @@ class KubeSpawner(Spawner):
 
                 else:
                     raise
+
+        # FIXME: add property to handle service creation
+        service = self.get_service_manifest()
+
+        try:
+            yield self.asynchronize(
+                self.api.create_namespaced_service,
+                namespace=self.namespace,
+                body=service)
+
+        except ApiException as e:
+            if e.status != 409:
+                raise
+
+            self.log.info("Service already exists, so did not create new service")
 
         # If we run into a 409 Conflict error, it means a pod with the
         # same name already exists. We stop it, wait for it to stop, and
