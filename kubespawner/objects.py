@@ -447,7 +447,7 @@ def make_service(
 
     service.spec = V1ServiceSpec()
 
-    service.spec.selector = selectors
+    service.spec.selector = selectors.copy()
     service.spec.ports = [V1ServicePort(**port) for port in ports]
 
     return service

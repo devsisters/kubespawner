@@ -299,6 +299,15 @@ class KubeSpawner(Spawner):
         """
     )
 
+    enable_singleuser_service = Bool(
+        False,
+        config=True,
+        help="""
+        Whether create additional service for single-user or not.
+        If you are using single-user container that launch spark on k8s with client mode, this option is required.
+        """
+    )
+
     service_name_template = Unicode(
         'service-{username}{servername}',
         config=True,
@@ -310,6 +319,38 @@ class KubeSpawner(Spawner):
         This must be unique within the namespace the pvc are being spawned
         in, so if you are running multiple jupyterhubs spawning in the
         same namespace, consider setting this to be something more unique.
+        """
+    )
+
+    service_ports = List(
+        config=True,
+        help="""
+        List of ports config for pod-specific config
+        
+        Example of service port is following
+        ```
+        service_ports:
+          - name: driver-port
+            protocol: TCP
+            port: 5555
+            target_port: 5555
+          - name: block-manager-port
+            protocol: TCP
+            port: 5556
+            target_port: 5556
+        ```
+        
+        """
+    )
+
+    service_env_name = Unicode(
+        'JUPYTERHUB_SINGLEUSER_SERVICE_NAME',
+        config=True,
+        help="""
+        Env variable name to inject single-user container
+        
+        `{username}` is expanded to the escaped, dns-label safe username.
+        
         """
     )
 
@@ -1024,6 +1065,13 @@ class KubeSpawner(Spawner):
         </label>
         {% endfor %}
         </div>
+        <h2>Custom environment variables</h2>
+        {% for env_option_key, env_option_value in env_option_list.items() %}
+        <div class="form-group" id='kubespawner-profile-env-{{ env_option }}'>
+            <label for="{{ env_option_key }}">{{ env_option_key }}</label>
+            <input class="form-control" name="{{ env_option_key }}" value="{{ env_option_value | default('', true) }}"/>
+        </div>
+        {% endfor %}
         """,
         config=True,
         help="""
@@ -1105,6 +1153,21 @@ class KubeSpawner(Spawner):
         a list. Note that the interface of the spawner class is not deemed stable
         across versions, so using this functionality might cause your JupyterHub
         or kubespawner upgrades to break.
+        """
+    )
+
+    env_option_list = Dict(
+        config=True,
+        help="""
+        Dictionary of options (with default values) for customizing user profiles
+
+        Signature is" `Dict()`, where each item is a key (displayed in form) with default values.
+
+        Examples:
+        {
+          "EXECUTOR_COUNT": 5,
+          "MEMORY_PER_EXECUTOR": "10G"
+        }
         """
     )
 
@@ -1391,31 +1454,18 @@ class KubeSpawner(Spawner):
             annotations=annotations
         )
 
-    # FIXME: This is naive approach.. (borrow selector from extraLabels)
     def get_service_manifest(self):
         """
         Make a service manifest that will spawn current user's service.
         """
-        selectors = self._expand_all(self.extra_labels)
-        ports = [
-            {
-                'protocol': 'TCP',
-                'port': 5555,
-                'target_port': 5555,
-                'name': 'driver-port'
-            },
-            {
-                'protocol': 'TCP',
-                'port': 5556,
-                'target_port': 5556,
-                'name': 'block-manager-port'
-            }
-        ]
+
+        # XXX(kimtkyeom): Need more neat way to fill selector..
+        selectors = self._expand_all(dict(self.common_labels, **self.extra_labels))
 
         return make_service(
             name=self.service_name,
             selectors=selectors,
-            ports=ports
+            ports=self.service_ports
         )
 
     def is_pod_running(self, pod):
@@ -1460,8 +1510,11 @@ class KubeSpawner(Spawner):
         env['JUPYTER_IMAGE_SPEC'] = self.image
         env['JUPYTER_IMAGE'] = self.image
 
-        # FIXME: Inject service host info.. how to inject this information more clearly??
-        env['JUPYTERHUB_SINGLEUSER_SERVICE_NAME'] = self.service_name
+        # Inject env var for service name
+        env[self.service_env_name] = self.service_name
+
+        # Update user provided options
+        env.update(self.user_options.get('env', {}))
 
         return env
 
@@ -1721,19 +1774,20 @@ class KubeSpawner(Spawner):
                     raise
 
         # FIXME: add property to handle service creation
-        service = self.get_service_manifest()
+        if self.enable_singleuser_service:
+            service = self.get_service_manifest()
 
-        try:
-            yield self.asynchronize(
-                self.api.create_namespaced_service,
-                namespace=self.namespace,
-                body=service)
+            try:
+                yield self.asynchronize(
+                    self.api.create_namespaced_service,
+                    namespace=self.namespace,
+                    body=service)
 
-        except ApiException as e:
-            if e.status != 409:
-                raise
+            except ApiException as e:
+                if e.status != 409:
+                    raise
 
-            self.log.info("Service already exists, so did not create new service")
+                self.log.info("Service already exists, so did not create new service")
 
         # If we run into a 409 Conflict error, it means a pod with the
         # same name already exists. We stop it, wait for it to stop, and
@@ -1843,19 +1897,38 @@ class KubeSpawner(Spawner):
             self._start_watching_pods(replace=True)
             raise
 
+        if self.enable_singleuser_service:
+            self.log.info("Delete singleuser-service %s", self.service_name)
+            try:
+                yield self.asynchronize(
+                    self.api.delete_namespaced_service,
+                    name=self.service_name,
+                    namespace=self.namespace,
+                    body=delete_options,
+                    grace_period_seconds=grace_seconds
+                )
+            except ApiException as e:
+                if e.status == 404:
+                    self.log.warning(
+                        "No service %s to delete. Assuming already deleted.",
+                        self.service_name,
+                    )
+                else:
+                    raise
+
     @default('env_keep')
     def _env_keep_default(self):
         return []
 
-    def _render_options_form(self, profile_list):
+    def _render_options_form(self, profile_list, env_option_list):
         self._profile_list = profile_list
         profile_form_template = Environment(loader=BaseLoader).from_string(self.profile_form_template)
-        return profile_form_template.render(profile_list=profile_list)
+        return profile_form_template.render(profile_list=profile_list, env_option_list=self.env_option_list)
 
     @gen.coroutine
     def _render_options_form_dynamically(self, current_spawner):
         profile_list = yield gen.maybe_future(self.profile_list(current_spawner))
-        return self._render_options_form(profile_list)
+        return self._render_options_form(profile_list, self.env_option_list)
 
     @default('options_form')
     def _options_form_default(self):
@@ -1866,12 +1939,12 @@ class KubeSpawner(Spawner):
             '' when no `profile_list` has been defined
             The rendered template (using jinja2) when `profile_list` is defined.
         '''
-        if not self.profile_list:
+        if not self.profile_list and not self.env_option_list:
             return ''
         if callable(self.profile_list):
             return self._render_options_form_dynamically
         else:
-            return self._render_options_form(self.profile_list)
+            return self._render_options_form(self.profile_list, self.env_option_list)
 
     def options_from_form(self, formdata):
         """get the option selected by the user on the form
@@ -1895,18 +1968,28 @@ class KubeSpawner(Spawner):
         Returns:
             the selected user option
         """
-        if not self.profile_list or not hasattr(self, '_profile_list'):
-            return formdata
-        # Default to first profile if somehow none is provided
-        selected_profile = int(formdata.get('profile', [0])[0])
-        options = self._profile_list[selected_profile]
-        self.log.debug("Applying KubeSpawner override for profile '%s'", options['display_name'])
-        kubespawner_override = options.get('kubespawner_override', {})
-        for k, v in kubespawner_override.items():
-            if callable(v):
-                v = v(self)
-                self.log.debug(".. overriding KubeSpawner value %s=%s (callable result)", k, v)
-            else:
-                self.log.debug(".. overriding KubeSpawner value %s=%s", k, v)
-            setattr(self, k, v)
+        options = {}
+        if self.profile_list and hasattr(self, '_profile_list'):
+            # Default to first profile if somehow none is provided
+            selected_profile = int(formdata.get('profile', [0])[0])
+            options = self._profile_list[selected_profile]
+            self.log.debug("Applying KubeSpawner override for profile '%s'", options['display_name'])
+            kubespawner_override = options.get('kubespawner_override', {})
+            for k, v in kubespawner_override.items():
+                if callable(v):
+                    v = v(self)
+                    self.log.debug(".. overriding KubeSpawner value %s=%s (callable result)", k, v)
+                else:
+                    self.log.debug(".. overriding KubeSpawner value %s=%s", k, v)
+                setattr(self, k, v)
+
+        if self.env_option_list:
+            options['env'] = env = {}
+            for (k, v) in self.env_option_list.items():
+                # Quite weired behavior from formdata.. (all form values from form data is list type)
+                value_to_override = formdata.get(k, [v])[0]
+                if value_to_override:
+                    self.log.info("Overriding environment variables %s to %s", k, value_to_override)
+                    env[k] = value_to_override
+
         return options
